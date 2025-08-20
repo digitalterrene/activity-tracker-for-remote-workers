@@ -48,7 +48,9 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
     getPreferredModeForDomain(tab.url)
   );
   const [error, setError] = useState<string | null>(null);
+  const [showError, setShowError] = useState(false);
   const loadCheckTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const titleCheckIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
   // Generate URLs for both proxy and direct access
   const getProxyUrl = (url: string) => {
@@ -110,9 +112,119 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
     }
   };
 
+  // Track title changes for direct mode
+  const startTitleTracking = () => {
+    if (titleCheckIntervalRef.current) {
+      clearInterval(titleCheckIntervalRef.current);
+    }
+
+    titleCheckIntervalRef.current = setInterval(() => {
+      try {
+        const iframe = iframeRef.current;
+        if (iframe && iframe.contentDocument) {
+          const title = iframe.contentDocument.title;
+          if (title && title !== tab.title && title !== "Loading...") {
+            updateTab(tab.id, { title });
+          }
+        }
+      } catch (error) {
+        // Cross-origin error, can't access iframe document in direct mode
+        // We'll rely on other methods for title updates
+      }
+    }, 1000);
+  };
+
+  // Setup activity tracking for direct mode
+  const setupDirectModeTracking = () => {
+    if (currentMode !== "direct") return;
+
+    try {
+      const iframe = iframeRef.current;
+      if (!iframe || !iframe.contentWindow) return;
+
+      // Inject tracking script directly into the iframe
+      const script = `
+        <script>
+          (function() {
+            // Track page title changes
+            let currentTitle = document.title;
+            
+            // Track clicks
+            document.addEventListener('click', function(e) {
+              window.parent.postMessage({
+                type: 'activityTracked',
+                activityType: 'click',
+                details: {
+                  element: e.target.tagName,
+                  id: e.target.id || '',
+                  className: e.target.className || '',
+                  x: e.clientX,
+                  y: e.clientY
+                }
+              }, '*');
+            }, true);
+            
+            // Track input changes
+            document.addEventListener('input', function(e) {
+              window.parent.postMessage({
+                type: 'activityTracked',
+                activityType: 'input',
+                details: {
+                  element: e.target.tagName,
+                  id: e.target.id || '',
+                  className: e.target.className || '',
+                  value: e.target.value.substring(0, 100)
+                }
+              }, '*');
+            });
+            
+            // Track form submissions
+            document.addEventListener('submit', function(e) {
+              window.parent.postMessage({
+                type: 'activityTracked',
+                activityType: 'form_submit',
+                details: {
+                  formId: e.target.id || ''
+                }
+              }, '*');
+            });
+            
+            // Periodically check for title changes
+            setInterval(() => {
+              if (document.title !== currentTitle) {
+                currentTitle = document.title;
+                window.parent.postMessage({
+                  type: 'titleChanged',
+                  title: document.title
+                }, '*');
+              }
+            }, 1000);
+          })();
+        </script>
+      `;
+
+      // Try to inject the script
+      if (
+        iframe.contentDocument &&
+        !iframe.contentDocument.querySelector("script[data-activity-tracker]")
+      ) {
+        const div = iframe.contentDocument.createElement("div");
+        div.innerHTML = script;
+        div
+          .querySelector("script")
+          ?.setAttribute("data-activity-tracker", "true");
+        iframe.contentDocument.body.appendChild(div);
+      }
+    } catch (error) {
+      // Cross-origin error, can't inject script in direct mode
+      console.log("Cannot inject tracking script in direct mode due to CORS");
+    }
+  };
+
   // Handle successful load
   const handleLoadSuccess = () => {
     setError(null);
+    setShowError(false);
 
     if (recording) {
       addActivity({
@@ -126,20 +238,26 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
       });
     }
 
-    // Update tab loading state
+    // Update tab loading state and title
     updateTab(tab.id, { loading: false });
 
-    // Try to get the title from the iframe
-    try {
-      const iframe = iframeRef.current;
-      if (iframe && iframe.contentDocument) {
-        const title = iframe.contentDocument.title;
-        if (title && title !== tab.title) {
-          updateTab(tab.id, { title });
+    // Start title tracking for direct mode
+    if (currentMode === "direct") {
+      startTitleTracking();
+      setupDirectModeTracking();
+
+      // Try to get initial title
+      try {
+        const iframe = iframeRef.current;
+        if (iframe && iframe.contentDocument) {
+          const title = iframe.contentDocument.title;
+          if (title && title !== "Loading..." && title !== tab.title) {
+            updateTab(tab.id, { title });
+          }
         }
+      } catch (error) {
+        // Cross-origin error, we'll rely on other methods
       }
-    } catch (error) {
-      // Cross-origin error, we'll rely on the message-based title update
     }
 
     // Remember successful mode for this domain
@@ -149,6 +267,7 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
   // Handle load failure
   const handleLoadFailure = (reason: string) => {
     setError(`Failed to load with ${currentMode}: ${reason}`);
+    setShowError(true);
     updateTab(tab.id, { loading: false });
 
     addActivity({
@@ -192,7 +311,8 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
   const switchToDirectMode = () => {
     setCurrentMode("direct");
     setError("Switching to direct mode...");
-    updateTab(tab.id, { loading: true });
+    setShowError(true);
+    updateTab(tab.id, { loading: true, title: "Loading..." });
 
     addActivity({
       type: "navigation",
@@ -209,7 +329,8 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
   const switchToProxyMode = () => {
     setCurrentMode("proxy");
     setError("Switching to proxy mode...");
-    updateTab(tab.id, { loading: true });
+    setShowError(true);
+    updateTab(tab.id, { loading: true, title: "Loading..." });
 
     addActivity({
       type: "navigation",
@@ -220,6 +341,11 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
         method: "manual",
       },
     });
+  };
+
+  // Dismiss error panel
+  const dismissError = () => {
+    setShowError(false);
   };
 
   // Handle message events from the iframe
@@ -241,21 +367,7 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
       }
 
       // Handle activity tracking
-      if (
-        event.data.type === "activities_flush" &&
-        Array.isArray(event.data.activities)
-      ) {
-        // Add all activities from the flush
-        event.data.activities.forEach((activity: any) => {
-          addActivity({
-            type: activity.type,
-            tabId: tab.id,
-            url: activity.url || tab.url,
-            details: activity.details,
-          });
-        });
-      } else if (event.data.type === "activityTracked") {
-        // Handle individual activities (backward compatibility)
+      if (event.data.type === "activityTracked") {
         addActivity({
           type: event.data.activityType,
           tabId: tab.id,
@@ -274,18 +386,25 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
     const newMode = getPreferredModeForDomain(tab.url);
     setCurrentMode(newMode);
     setError(null);
+    setShowError(false);
     setLoaded(false);
 
     if (loadCheckTimeoutRef.current) {
       clearTimeout(loadCheckTimeoutRef.current);
     }
+    if (titleCheckIntervalRef.current) {
+      clearInterval(titleCheckIntervalRef.current);
+    }
   }, [tab.url]);
 
-  // Cleanup timeout on unmount
+  // Cleanup on unmount
   useEffect(() => {
     return () => {
       if (loadCheckTimeoutRef.current) {
         clearTimeout(loadCheckTimeoutRef.current);
+      }
+      if (titleCheckIntervalRef.current) {
+        clearInterval(titleCheckIntervalRef.current);
       }
     };
   }, []);
@@ -305,11 +424,18 @@ export default function ProxyBrowserView({ tab }: ProxyBrowserViewProps) {
         </div>
       )}
 
-      {error && (
+      {showError && error && (
         <div className="absolute top-12 left-2 right-2 bg-yellow-100 border border-yellow-400 text-yellow-700 px-4 py-3 rounded z-10">
           <div className="flex justify-between items-center">
             <span className="flex-1">{error}</span>
             <div className="flex space-x-2 ml-4">
+              <button
+                onClick={dismissError}
+                className="text-yellow-800 hover:text-yellow-900 font-bold px-2 py-1 border border-yellow-600 rounded text-xs"
+                title="Dismiss"
+              >
+                ✕
+              </button>
               <button
                 onClick={switchToProxyMode}
                 className="text-yellow-800 hover:text-yellow-900 font-bold px-2 py-1 border border-yellow-600 rounded text-xs"
